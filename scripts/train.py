@@ -103,9 +103,13 @@ def sinusoidal_embedding(timesteps: torch.Tensor, dim: int):
     return emb
 
 
-
-
-class ResidualBlock(nn.Module):
+# ResidualBlock for the U-Net architecture, which includes the time embedding projection and skip 
+# conneciton for the residual conneciton.
+# The block consists of two convolustional layers with group normalization and SiLU activation,
+# and a linear layer to project the time embedding to the appropriate number of channels, which is 
+# added to the activations after the first convolution. 
+# The skip connection is either an identity or a 1x1 convolution if the intput and output channles differ
+class ResidualBlock (nn.Module):
     def __init__(self, in_channels: int, out_channels: int, time_dim: int):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
@@ -119,9 +123,11 @@ class ResidualBlock(nn.Module):
             self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
             self.skip = nn.Identity()
-
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor):
+        # instantiate the residual connection, so we can add it back after the convs
         residual = self.skip(x)
+        # this is the first hidden layer of the block to apply first conv, then norm, then activation
         h = self.conv1(x)
         h = self.norm1(h)
         h = self.act(h)
@@ -135,23 +141,32 @@ class ResidualBlock(nn.Module):
         return h + residual
 
 
+
+
+# This is the main model architecture for the conditional UNet structure
 class ConditionalUNet(nn.Module):
     def __init__(self, in_channels: int = 4, out_channels: int = 1, base: int = 64, time_dim: int = 256):
         super().__init__()
+        # time_mlp for the time embedding projection, which basically does the sinusoidal embedding
         self.time_mlp = nn.Sequential(
             nn.Linear(time_dim, time_dim),
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
 
+        # this is the encoder and decoder structure of the UNet, which we first have the down sampling
+        # path with two residual blocks and conv layers for downsampling.
         self.enc1 = ResidualBlock(in_channels, base, time_dim)
-        self.down1 = nn.Conv2d(base, base, kernel_size=4, stride=2, padding=1)
+        self.down1 = nn.Conv2d(base, base, kernel_size=4, stride = 2, padding=1)
 
         self.enc2 = ResidualBlock(base, base * 2, time_dim)
         self.down2 = nn.Conv2d(base * 2, base * 2, kernel_size=4, stride=2, padding=1)
 
+        # mid section with the most dense and compressed information included is here
         self.mid = ResidualBlock(base * 2, base * 4, time_dim)
 
+        # upsampling so we undo the downsampling with conv transpose layers, and then we have the 
+        # corresponding residual blocks for the decoder, which also include skip connections
         self.up1 = nn.ConvTranspose2d(base * 4, base * 2, kernel_size=4, stride=2, padding=1)
         self.dec1 = ResidualBlock(base * 4, base * 2, time_dim)
 
@@ -161,7 +176,7 @@ class ConditionalUNet(nn.Module):
         self.out = nn.Conv2d(base, out_channels, kernel_size=1)
         self.time_dim = time_dim
 
-    def forward(self, noisy_depth: torch.Tensor, rgb: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, noisy_depth: torch.Tensor, rgb: torch.Tensor, t: torch.Tensor):
         x = torch.cat([noisy_depth, rgb], dim=1)
         t_emb = sinusoidal_embedding(t, self.time_dim)
         t_emb = self.time_mlp(t_emb)
@@ -179,6 +194,8 @@ class ConditionalUNet(nn.Module):
         return self.out(x)
 
 
+# iterate_minibatches is a helper function to take the list of samples from each chunk and 
+# create mini-batches of the specified batch size for training, with an option to shuffle the samples
 def iterate_minibatches(samples: list[dict[str, torch.Tensor]], batch_size: int, shuffle: bool = True):
     indices = list(range(len(samples)))
     if shuffle:
@@ -189,11 +206,20 @@ def iterate_minibatches(samples: list[dict[str, torch.Tensor]], batch_size: int,
         yield [samples[i] for i in batch_ids]
 
 
-def train(args: argparse.Namespace) -> None:
+
+# training loop
+# iterates over the dataset for the specified number of epochs, and for each chunk of samples,
+# it creates mini-batches and processes them through the model, computes the loss, and updates the model
+# weghts using AdamW. 
+# the loop also includes mixed precision training with torch.amp which basically does the forward
+# and backward passes in half precision to save memory and speed up training on compatible GPUs, while
+# still maintaining the stability of the training process.
+def train(args: argparse.Namespace):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print(f"Device: {device}")
 
-    dataset = ChunkedDepthDataset(args.data_root)
+    datset = DepthDataset(args.data_root)
+    # wrap dataloader
     loader = DataLoader(
         dataset,
         batch_size=1,
@@ -204,8 +230,9 @@ def train(args: argparse.Namespace) -> None:
     )
 
     model = ConditionalUNet(base=args.base_channels).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr = args.lr, weight_decay=args.weight_decay)
 
+    # initialize the noise schedule for the diffusion process
     betas = linear_beta_schedule(args.timesteps).to(device)
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
@@ -225,15 +252,21 @@ def train(args: argparse.Namespace) -> None:
         progress = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}")
         for chunk_samples in progress:
             for mini_samples in iterate_minibatches(chunk_samples, args.batch_size, shuffle=True):
+                # take the mini-batch of samples and preprocess them into tensors for model input
                 rgb, depth = preprocess_batch(mini_samples, device=device)
+                # sample random timesteps
                 t = torch.randint(0, args.timesteps, (depth.shape[0],), device=device).long()
+                # sample the noisy depth maps according to the forward process
                 noisy_depth, noise = forward_diffusion_sample(depth, t, alphas_cumprod)
 
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=use_amp):
+                    # predict the noise from the noisy depth and RGB input
+                    # then compute the MSE loss between the predicted noise and the acutal noise
                     noise_pred = model(noisy_depth, rgb, t)
                     loss = F.mse_loss(noise_pred, noise)
-
+                
+                # scaler does the backward pass with scaling for mixed precision
                 scaler.scale(loss).backward()
                 if args.grad_clip > 0:
                     scaler.unscale_(optimizer)
@@ -241,6 +274,7 @@ def train(args: argparse.Namespace) -> None:
                 scaler.step(optimizer)
                 scaler.update()
 
+                # updates for each parameter that we are interested in for logging
                 loss_value = float(loss.detach().item())
                 epoch_loss += loss_value
                 updates += 1
@@ -262,6 +296,8 @@ def train(args: argparse.Namespace) -> None:
             ckpt_path = out_dir / f"diffdepth_epoch_{epoch:03d}.pt"
             torch.save(checkpoint, ckpt_path)
             print(f"Saved checkpoint: {ckpt_path}")
+
+
 
 
 def build_parser() -> argparse.ArgumentParser:
