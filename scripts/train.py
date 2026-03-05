@@ -42,7 +42,8 @@ class DepthDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        return torch.load(self.files[idx], map_location="cuda" if torch.cuda.is_available() else "cpu")
+        # Always load on CPU; DataLoader workers + CUDA tensors is a common footgun.
+        return torch.load(self.files[idx], map_location="cpu")
 
 
 # chunk_collate for combining lists of samples from each chunk into a single list for mini-batch
@@ -88,6 +89,38 @@ def preprocess_batch(samples: list[dict[str, torch.Tensor]], device: torch.devic
     rgbs = torch.stack([s["rgb"] for s in samples]).to(device)
     depths = torch.stack([s["depth"] for s in samples]).to(device)
     return rgbs, depths
+
+
+def _auto_depth_divisor(depths: torch.Tensor) -> float:
+    # Heuristic: if depth is already in [0, 1], keep it.
+    # If it looks like 8-bit PNG, scale by 255. If 16-bit PNG, scale by 65535.
+    # This keeps diffusion inputs roughly unit scale.
+    max_val = float(depths.detach().max().item())
+    if max_val <= 1.0:
+        return 1.0
+    if max_val <= 255.0:
+        return 255.0
+    if max_val <= 65535.0:
+        return 65535.0
+    return max_val
+
+
+def normalize_depth(depths: torch.Tensor, mode: str, divisor: float | None) -> torch.Tensor:
+    if mode == "none":
+        return depths
+
+    if divisor is None:
+        divisor = _auto_depth_divisor(depths)
+    divisor = float(divisor)
+    if divisor <= 0:
+        raise ValueError("depth divisor must be > 0")
+
+    depths01 = depths / divisor
+    if mode == "0_1" or mode == "auto":
+        return depths01
+    if mode == "-1_1":
+        return depths01 * 2.0 - 1.0
+    raise ValueError(f"Unknown depth normalization mode: {mode}")
 
 
 
@@ -218,7 +251,7 @@ def train(args: argparse.Namespace):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print(f"Device: {device}")
 
-    datset = DepthDataset(args.data_root)
+    dataset = DepthDataset(args.data_root)
     # wrap dataloader
     loader = DataLoader(
         dataset,
@@ -238,7 +271,11 @@ def train(args: argparse.Namespace):
     alphas_cumprod = torch.cumprod(alphas, dim=0)
 
     use_amp = args.amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    # GradScaler is only needed/valid for fp16. BF16 generally trains fine without scaling,
+    # and is often more stable on ROCm.
+    use_scaler = use_amp and amp_dtype == torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -254,25 +291,34 @@ def train(args: argparse.Namespace):
             for mini_samples in iterate_minibatches(chunk_samples, args.batch_size, shuffle=True):
                 # take the mini-batch of samples and preprocess them into tensors for model input
                 rgb, depth = preprocess_batch(mini_samples, device=device)
+
+                # Normalize depth to a roughly unit scale for diffusion stability.
+                depth = normalize_depth(depth, mode=args.depth_norm, divisor=args.depth_divisor)
                 # sample random timesteps
                 t = torch.randint(0, args.timesteps, (depth.shape[0],), device=device).long()
                 # sample the noisy depth maps according to the forward process
                 noisy_depth, noise = forward_diffusion_sample(depth, t, alphas_cumprod)
 
                 optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device_type=device.type, enabled=use_amp):
+                with torch.autocast(device_type=device.type, enabled=use_amp, dtype=amp_dtype):
                     # predict the noise from the noisy depth and RGB input
                     # then compute the MSE loss between the predicted noise and the acutal noise
                     noise_pred = model(noisy_depth, rgb, t)
                     loss = F.mse_loss(noise_pred, noise)
                 
-                # scaler does the backward pass with scaling for mixed precision
-                scaler.scale(loss).backward()
-                if args.grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                if use_scaler:
+                    # scaler does the backward pass with scaling for mixed precision fp16
+                    scaler.scale(loss).backward()
+                    if args.grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    optimizer.step()
 
                 # updates for each parameter that we are interested in for logging
                 loss_value = float(loss.detach().item())
@@ -305,6 +351,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", required=True, help="Path to processed train chunks (*.pt)")
     parser.add_argument("--out-dir", default="checkpoints", help="Directory to save model checkpoints")
 
+    parser.add_argument("--cpu", action="store_true", help="Force CPU training")
+
+    parser.add_argument(
+        "--depth-norm",
+        default="auto",
+        choices=["auto", "none", "0_1", "-1_1"],
+        help="Depth normalization applied during training",
+    )
+    parser.add_argument(
+        "--depth-divisor",
+        type=float,
+        default=None,
+        help="Optional divisor for depth normalization (e.g., 255 or 65535). If omitted, uses an auto heuristic.",
+    )
+
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="Mini-batch size within each chunk")
     parser.add_argument("--timesteps", type=int, default=1000, help="Diffusion timesteps T")
@@ -318,7 +379,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--save-every", type=int, default=1, help="Checkpoint frequency in epochs")
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision on CUDA")
-    parser.add_argument("--cpu", action="store_true", help="Force CPU training")
+    parser.add_argument(
+        "--amp-dtype",
+        default="bf16",
+        choices=["bf16", "fp16"],
+        help="Autocast dtype when --amp is enabled (bf16 is usually more stable on ROCm)",
+    )
 
     return parser
 
